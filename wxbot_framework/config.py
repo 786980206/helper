@@ -67,6 +67,10 @@ class ConfigStore:
         from .text import validate_target
         for target in allowed:
             validate_target(target)
+        image_directory = data.get("image_directory", ".runtime/images")
+        if (not isinstance(image_directory, str) or not image_directory.strip() or
+                "\0" in image_directory):
+            raise ValueError("image_directory 应为图片保存目录路径")
         pid = data.get("wechat_pid")
         if pid is not None and (type(pid) is not int or pid <= 0):
             raise ValueError("wechat_pid 应为正整数或 null")

@@ -12,6 +12,7 @@ from typing import Mapping, Any
 
 from .text import validate_target, validate_mentions
 from .pacing import TextSendDelay
+from .images import validate_image_path
 
 logger = logging.getLogger("TextSend")
 
@@ -35,14 +36,28 @@ class Message:
     received_at: float = field(default_factory=time.monotonic)
     data: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
+    @property
+    def image_path(self):
+        return self.data.get("image_path") or ""
+
     @classmethod
     def from_native(cls, protocol, data, session_id):
         snapshot = copy.deepcopy(data)
         room = snapshot.get("room_wxid") or ""
-        return cls(text=snapshot.get("msg") or snapshot.get("content") or "",
+        msg_type = snapshot.get("wx_type", snapshot.get("type", 1))
+        if type(msg_type) is not int or msg_type <= 0:
+            raise ValueError("微信消息类型必须是正整数")
+        text = snapshot.get("msg") or snapshot.get("content") or ""
+        if msg_type == 3:
+            snapshot.setdefault("raw_content", text)
+            text = ""
+        # 群图片可能暂时没有作者；显式空作者不能回退成群 ID。
+        sender = (snapshot.get("sender_id") or "") if "sender_id" in snapshot else (
+            snapshot.get("native_sender") or snapshot.get("from_wxid") or "")
+        return cls(text=text,
                    chat_id=snapshot.get("chat_id") or room or snapshot.get("from_wxid") or "",
-                   sender_id=snapshot.get("sender_id") or snapshot.get("native_sender") or snapshot.get("from_wxid") or "",
-                   receiver_id=snapshot.get("native_receiver") or "", protocol=protocol,
+                   sender_id=sender,
+                   receiver_id=snapshot.get("native_receiver") or "", protocol=protocol, type=msg_type,
                    is_group=bool(room), is_self=bool(snapshot.get("is_self", False)), sequence=snapshot.get("sequence", 0),
                    session_id=session_id, data=MappingProxyType(snapshot))
 
@@ -103,6 +118,25 @@ class ServiceFacade:
                         return backend.send_at_text(to_wxid, content, _mentions)
                     return backend.send_text(to_wxid, content)
 
+    def send_image(self, to_wxid, path, *, expected_session=None, delivery_guard=None):
+        validate_target(to_wxid)
+        image_path = validate_image_path(path)
+        with self._lock:
+            if self._backend is None or not self._available:
+                raise RuntimeError("微信尚未连接")
+            if expected_session and expected_session != self._backend.session_id:
+                raise RuntimeError("消息所属的微信连接已结束，跳过旧会话回复")
+            if not callable(getattr(self._backend, "send_image", None)):
+                raise CapabilityError("当前后端尚未开放图片发送")
+            backend, cancel = self._backend, self._cancel
+        with self._send_lock:
+            # 排队期间文件可能被清理或替换，发送前重新核对实际文件。
+            image_path = validate_image_path(image_path)
+            with self._lock:
+                self._check_pending(backend, cancel)
+                with delivery_guard() if delivery_guard is not None else nullcontext():
+                    return backend.send_image(to_wxid, str(image_path))
+
     def send_at_text(self, room_wxid, content, at_list, *, expected_session=None, display_names=None, delivery_guard=None):
         members = validate_mentions(room_wxid, at_list)
         if not isinstance(content, str) or not content:
@@ -119,7 +153,7 @@ class ServiceFacade:
 
     def _check_pending(self, backend, cancel):
         if cancel.is_set() or not self._available or self._backend is not backend or self._cancel is not cancel:
-            raise RuntimeError("微信连接已结束，取消待发送文本")
+            raise RuntimeError("微信连接已结束，取消待发送消息")
 
     def cancel_pending(self):
         with self._lock:
@@ -149,6 +183,9 @@ class LegacyService:
 
     def send_text(self, to_wxid, content):
         return self._service.send_text(to_wxid, content, expected_session=self._session_id)
+
+    def send_image(self, to_wxid, path):
+        return self._service.send_image(to_wxid, path, expected_session=self._session_id)
 
     def send_payload(self, payload):
         return self._service.send_payload(payload, expected_session=self._session_id)
@@ -183,6 +220,9 @@ class PluginContext:
     def send_text(self, chat_id, text):
         return self._service.send_text(chat_id, text)
 
+    def send_image(self, chat_id, path):
+        return self._service.send_image(chat_id, path)
+
     def personality(self, message):
         from .personality import PersonalityState
         return self._members.personality(message.chat_id) if self._members is not None else PersonalityState(message.chat_id)
@@ -204,6 +244,10 @@ class PluginContext:
     def reply(self, message, text, *, delivery_guard=None):
         return self._service.send_text(message.chat_id, text, expected_session=message.session_id,
                                        delivery_guard=delivery_guard)
+
+    def reply_image(self, message, path, *, delivery_guard=None):
+        return self._service.send_image(message.chat_id, path, expected_session=message.session_id,
+                                        delivery_guard=delivery_guard)
 
     def reply_at(self, message, text, *, display_name=None, delivery_guard=None):
         if not message.is_group:

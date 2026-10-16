@@ -1,12 +1,13 @@
-"""好友、群聊和文件传输助手的原生文本服务。"""
+"""好友、群聊和文件传输助手的原生文本、图片服务。"""
 from __future__ import annotations
 
 import logging
 import time
 import ctypes as c
 from collections import deque
+from pathlib import Path
 
-from filehelper_service import NativeFileHelperService, ReceivedTextMessage
+from filehelper_service import NativeFileHelperService, ReceivedMediaMessage
 from wxbot_framework.mentions import parse_at_members
 from run_selftest import TEXT_DLL, K, check, modules, wechat_candidates, run
 from wxbot_framework.text import TextRouter, validate_target, validate_mentions
@@ -65,11 +66,11 @@ def find_account_process(account=None):
 
 class NativeTextService(NativeFileHelperService):
     _dll = TEXT_DLL
-    _poll_export = b"WxPollTextMessageV2"
-    _message_type = ReceivedTextMessage
+    _poll_export = b"WxPollMediaMessageV3"
+    _message_type = ReceivedMediaMessage
     _run = staticmethod(run_text)
 
-    def __init__(self, *, account=None, **options):
+    def __init__(self, *, account=None, media_directory=None, image_allowlist=(), **options):
         super().__init__(**options)
         self.preferred_account = validate_account(account) if account is not None else None
         self.router = TextRouter(include_self_groups=True)
@@ -77,6 +78,9 @@ class NativeTextService(NativeFileHelperService):
         self._next_account_check = 0
         self._sent_texts = deque(maxlen=64)
         self.mention_messages = 0
+        self.media_directory = Path(media_directory or Path(__file__).resolve().parent.parent / ".runtime/images")
+        self.image_allowlist = frozenset(image_allowlist)
+        self._image_receiver = None
 
     @property
     def self_wxid(self):
@@ -92,7 +96,7 @@ class NativeTextService(NativeFileHelperService):
             # 手动指定 PID 时也先只读核对，避免向其他账号加载 DLL。
             raise RuntimeError("目标进程登录的不是绑定的机器人账号，等待正确账号登录")
         result = super().start()
-        logger.info("当前登录微信ID=%s；好友和群聊文本已就绪", self.self_wxid)
+        logger.info("当前登录微信ID=%s；好友和群聊文本、图片已就绪", self.self_wxid)
         return result
 
     def _read_account(self):
@@ -106,6 +110,49 @@ class NativeTextService(NativeFileHelperService):
             raise RuntimeError("目标进程登录的不是绑定的机器人账号，等待正确账号登录")
         self.router.set_account(account)
         self._next_account_check = time.monotonic() + 1
+        from wxbot_framework.image_metadata import ImageStore
+        from wxbot_framework.image_receiver import ImageReceiver
+        self._image_receiver = ImageReceiver(ImageStore(self.media_directory, account),
+            self._download_image, self._deliver_image,
+            lambda: not self._stop.is_set() and self._owns_bridge and self.self_wxid == account)
+
+    def _download_image(self, metadata, destination):
+        filekey = metadata.cdnmidimgurl or metadata.filekey or metadata.cdnbigimgurl or metadata.cdnthumburl
+        aeskey = metadata.aeskey if (metadata.cdnmidimgurl or metadata.filekey or metadata.cdnbigimgurl) else (metadata.cdnthumbaeskey or metadata.aeskey)
+        image_type = (2 if metadata.cdnmidimgurl or metadata.filekey else
+                      1 if metadata.cdnbigimgurl else 3)
+        if not filekey or not aeskey:
+            return False
+        with self._calls:
+            if not self._owns_bridge or self._stop.is_set():
+                return False
+            self._check_account(force=True)
+            result = self._run("--download-image", pid=self.pid, keep_loaded=True,
+                preserve_report=self.preserve_reports,
+                download_image={"destination": str(destination), "filekey": filekey,
+                                "aeskey": aeskey, "image_type": image_type})
+            self._check_account(force=True)
+            return result.get("success") is True
+
+    def _deliver_image(self, data):
+        if self._stop.is_set():
+            return
+        logger.info("图片接收 | 会话ID=%s | 状态=%s | 文件=%s", data["chat_id"],
+                    data.get("image_status"), data.get("image_path", ""))
+        for handler in list(self.msg_handlers):
+            try:
+                handler(self.pid, 11046, data, self)
+            except Exception:
+                logger.exception("图片消息处理器异常")
+
+    def stop(self):
+        self._stop.set()
+        if self._image_receiver is not None:
+            self._image_receiver.close(timeout=30)
+            if self._image_receiver.is_alive:
+                raise RuntimeError("图片原生下载尚未结束，保留桥接等待清理重试")
+            self._image_receiver = None
+        return super().stop()
 
     def _check_account(self, *, force=False):
         if not force and time.monotonic() < self._next_account_check:
@@ -132,17 +179,18 @@ class NativeTextService(NativeFileHelperService):
         return name
 
     def _map_message(self, message):
-        if message.type != 1:
+        if message.type not in (1, 3):
             return None
         previous = self.self_wxid
         previous_unparsed = self.router.unparsed_groups
+        body = (getattr(message, "image_xml", b"") if message.type == 3 else message.text).decode("utf-8")
         data = self.router.convert(message.sender.decode("utf-8"), message.receiver.decode("utf-8"),
-                                   message.text.decode("utf-8"), sequence=message.sequence,
+                                   body, sequence=message.sequence, msg_type=message.type,
                                    thread_id=message.thread_id)
         if self.self_wxid and not previous:
             logger.info("当前账号已识别；好友和群聊文本已就绪")
         if data:
-            name = self._sender_wechat_name(data["sender_id"])
+            name = self._sender_wechat_name(data["sender_id"]) if data["sender_id"] else None
             if name:
                 data["sender_wechat_name"] = name
             source = getattr(message, "mention_source", b"").decode("utf-8", errors="replace")
@@ -160,6 +208,10 @@ class NativeTextService(NativeFileHelperService):
                 data["dispatch_to_plugins"] = True
             self.chats[data["chat_id"]] = {"chat_id": data["chat_id"],
                                            "is_group": bool(data["room_wxid"])}
+            if message.type == 3 and self._image_receiver is not None:
+                if not self.image_allowlist or data["chat_id"] in self.image_allowlist:
+                    self._image_receiver.submit(data)
+                return None
         elif self.router.unparsed_groups > previous_unparsed:
             # 第一条失败时提示；后续通过 status 查看累计数。
             if self.router.unparsed_groups == 1:
@@ -172,6 +224,19 @@ class NativeTextService(NativeFileHelperService):
     def send_at_text(self, room_wxid, content, at_list):
         members = validate_mentions(room_wxid, at_list)
         return self._send_text(room_wxid, content, mentions=members)
+
+    def send_image(self, to_wxid, path):
+        from wxbot_framework.images import validate_image_path
+        validate_target(to_wxid)
+        path = validate_image_path(path)
+        with self._calls:
+            if not self._owns_bridge or self._stop.is_set():
+                raise RuntimeError("原生图片服务没有运行")
+            self._check_account(force=True)
+            self.last_result = self._run("--dispatch", pid=self.pid, image_path=path,
+                                        target=to_wxid, keep_loaded=True,
+                                        preserve_report=self.preserve_reports)
+            return self.last_result["success"]
 
     def _send_text(self, to_wxid, content, *, mentions=None):
         validate_target(to_wxid)

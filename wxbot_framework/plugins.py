@@ -26,6 +26,7 @@ class PluginSpec:
     api: str
     description: str
     requires: frozenset
+    message_types: frozenset = frozenset({1})
 
 
 class PluginRecord:
@@ -139,9 +140,14 @@ class PluginManager:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig")) if manifest_path.exists() else {}
                 api = manifest.get("api", "v1")
                 requires = manifest.get("requires", ["text.receive"])
+                message_types = manifest.get("message_types", [1])
                 if api not in ("v1", "legacy") or not isinstance(requires, list) or not all(isinstance(x, str) for x in requires):
                     raise ValueError("plugin.json 的 api / requires 不合法")
-                specs[name] = PluginSpec(name, path, api, str(manifest.get("description", "")), frozenset(requires))
+                if (not isinstance(message_types, list) or not message_types or
+                        any(type(value) is not int or value <= 0 for value in message_types)):
+                    raise ValueError("plugin.json 的 message_types 必须是非空正整数列表")
+                specs[name] = PluginSpec(name, path, api, str(manifest.get("description", "")),
+                                         frozenset(requires), frozenset(message_types))
             except Exception as error:
                 self.load_errors[directory.name] = str(error)
                 logger.error("插件 %s 无法发现：%s", directory.name, error)
@@ -251,7 +257,8 @@ class PluginManager:
         with self._lock:
             records = tuple(self.records.values())
         for record in records:
-            record.enqueue(message)
+            if message.type in record.spec.message_types:
+                record.enqueue(message)
 
     def status(self):
         specs = self.discover()

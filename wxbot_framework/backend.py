@@ -9,7 +9,8 @@ from .sdk import Message
 
 CAPABILITIES = frozenset({"text.receive", "text.send"})
 TEXT_CAPABILITIES = CAPABILITIES | frozenset({"friend.text.receive", "friend.text.send",
-                                           "group.text.receive", "group.text.send", "group.text.mention"})
+                                           "group.text.receive", "group.text.send", "group.text.mention",
+                                           "image.receive", "image.send"})
 
 
 class NativeFileHelperBackend:
@@ -46,7 +47,7 @@ class NativeFileHelperBackend:
 
 
 class NativeTextBackend(NativeFileHelperBackend):
-    scope = "文件传输助手、好友和群聊文本"
+    scope = "文件传输助手、好友和群聊的文本、图片"
 
     def __init__(self, root, config):
         native = Path(root) / "native"
@@ -56,6 +57,8 @@ class NativeTextBackend(NativeFileHelperBackend):
             sys.path.insert(0, str(native))
         from text_service import NativeTextService
         self.raw = NativeTextService(pid=config.get("wechat_pid"), account=config.get("wechat_account"),
+                                     media_directory=Path(root) / config.get("image_directory", ".runtime/images"),
+                                     image_allowlist=config.get("chat_allowlist", []),
                                      preserve_reports=False)
         self.session_id = uuid.uuid4().hex
 
@@ -75,3 +78,6 @@ class NativeTextBackend(NativeFileHelperBackend):
 
     def send_at_text(self, room_wxid, content, at_list):
         return self.raw.send_at_text(room_wxid, content, at_list)
+
+    def send_image(self, chat_id, path):
+        return self.raw.send_image(chat_id, path)

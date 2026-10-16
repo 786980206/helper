@@ -1,6 +1,7 @@
 {
   "backend": "native_text",
   "chat_allowlist": [],
+  "image_directory": ".runtime/images",
   "wechat_pid": null,
   "wechat_account": null,
   "reconnect_seconds": 5,

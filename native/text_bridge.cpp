@@ -1,6 +1,7 @@
 // 通用文本桥接。复用已经实测的版本指纹、字符串分配器、任务调度和卸载保护。
 // 单独生成 text_bridge.dll，不替换仍在运行的 selftest_bridge.dll。
 #define WXBOT_EXTENDED_RECEIVE
+#define WXBOT_MEDIA_RECEIVE
 #include "selftest_bridge.cpp"
 
 struct TextConfig {
@@ -238,21 +239,43 @@ static bool try_read_source(const unsigned char* message, size_t offset, char* o
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-static void sample_all_text(const uintptr_t* batch) {
+struct ReceiveStatistics {
+    uint32_t size, reserved;
+    LONG64 batches, messages, texts, images, queued_images, invalid_images, last_type;
+};
+static ReceiveStatistics receive_statistics{};
+static_assert(sizeof(ReceiveStatistics) == 64, "Unexpected receive statistics ABI");
+
+static void sample_all_text(const uintptr_t* batch, size_t stride) {
     __try {
-        if (!batch || batch[1] < batch[0] || (batch[1] - batch[0]) % 0x78 != 0 ||
-            (batch[1] - batch[0]) / 0x78 > 512) return;
-        for (uintptr_t address = batch[0]; address < batch[1]; address += 0x78) {
+        _InterlockedIncrement64(&receive_statistics.batches);
+        if (!batch || batch[1] < batch[0] || (batch[1] - batch[0]) % stride != 0 ||
+            (batch[1] - batch[0]) / stride > 512) return;
+        for (uintptr_t address = batch[0]; address < batch[1]; address += stride) {
             const auto message = reinterpret_cast<const unsigned char*>(address);
-            if (*reinterpret_cast<const uint32_t*>(message + 0x14) != 1) continue;
+            const uint32_t type = *reinterpret_cast<const uint32_t*>(message + 0x14);
+            _InterlockedIncrement64(&receive_statistics.messages);
+            _InterlockedExchange64(&receive_statistics.last_type, type);
+            if (type == 1) _InterlockedIncrement64(&receive_statistics.texts);
+            if (type == 3) _InterlockedIncrement64(&receive_statistics.images);
+            if (type != 1 && type != 3) continue;
             char sender[128]{}, receiver[128]{}, text[1024]{};
             if (!read_pb_string(message, 8, sender, sizeof(sender)) || !valid_target(sender) ||
-                !read_pb_string(message, 0x18, receiver, sizeof(receiver)) || !valid_target(receiver) ||
-                !read_pb_string(message, 0x20, text, sizeof(text))) continue;
+                !read_pb_string(message, 0x18, receiver, sizeof(receiver)) || !valid_target(receiver)) continue;
             // 接收瞬间复制元数据，不持有任何微信消息对象或字符串指针。
             char source[4096]{};
             if (!try_read_source(message, 0x38, source, sizeof(source))) source[0] = 0;
-            enqueue_received(sender, receiver, text, source);
+            if (type == 3) {
+                char image_xml[16384]{};
+                if (read_pb_string(message, 0x20, image_xml, sizeof(image_xml))) {
+                    enqueue_received(sender, receiver, "", source, type, image_xml);
+                    _InterlockedIncrement64(&receive_statistics.queued_images);
+                } else {
+                    _InterlockedIncrement64(&receive_statistics.invalid_images);
+                }
+            } else if (read_pb_string(message, 0x20, text, sizeof(text))) {
+                enqueue_received(sender, receiver, text, source);
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         // 布局不匹配时放弃采样，真实客户端仍按原逻辑收消息。
@@ -263,7 +286,7 @@ static uintptr_t __fastcall text_receive(void* manager, const uintptr_t* batch, 
     _InterlockedIncrement(&active_callbacks);
     uintptr_t result = 0;
     __try {
-        sample_all_text(batch);
+        sample_all_text(batch, 0x78);
         result = original_receive(manager, batch, flag1, flag2);
     } __finally { _InterlockedDecrement(&active_callbacks); }
     return result;
@@ -279,6 +302,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxStartTextReceiver(void* paramete
     AcquireSRWLockExclusive(&receive_lock);
     receive_head = receive_count = receive_dropped = 0;
     receive_sequence = 0;
+    receive_statistics = {};
     ReleaseSRWLockExclusive(&receive_lock);
     MH_STATUS status = MH_Initialize();
     if (status != MH_OK) return 600 + status;
@@ -286,7 +310,9 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxStartTextReceiver(void* paramete
     status = MH_CreateHook(target, reinterpret_cast<void*>(&text_receive), reinterpret_cast<void**>(&original_receive));
     if (status != MH_OK) { MH_Uninitialize(); return 600 + status; }
     status = MH_EnableHook(target);
-    if (status != MH_OK) { MH_RemoveHook(target); MH_Uninitialize(); return 600 + status; }
+    if (status != MH_OK) {
+        MH_RemoveHook(target); MH_Uninitialize(); return 600 + status;
+    }
     receive_hook_created = true;
     return 0;
 }
@@ -295,15 +321,37 @@ extern "C" __declspec(dllexport) DWORD WINAPI WxPollTextMessage(void* parameter)
     // 保留旧接口的 1312 字节边界，旧调用者不会被 V2 写越界。
     if (!parameter) return ERROR_INVALID_PARAMETER;
     ReceivedMessage message{};
-    const DWORD code = WxPollFileHelperMessage(&message);
+    const DWORD code = poll_received(&message);
     std::memcpy(parameter, &message, 1312);
     *static_cast<uint32_t*>(parameter) = 1312;
     return code;
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI WxPollTextMessageV2(void* parameter) {
-    return WxPollFileHelperMessage(parameter);
+    if (!parameter) return ERROR_INVALID_PARAMETER;
+    ReceivedMessage message{};
+    const DWORD code = poll_received(&message);
+    std::memcpy(parameter, &message, 5408);
+    *static_cast<uint32_t*>(parameter) = 5408;
+    return code;
 }
+
+extern "C" __declspec(dllexport) DWORD WINAPI WxPollMediaMessageV3(void* parameter) {
+    return poll_received(static_cast<ReceivedMessage*>(parameter));
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI WxGetReceiveStatistics(void* parameter) {
+    if (!parameter) return ERROR_INVALID_PARAMETER;
+    _InterlockedIncrement(&active_callbacks);
+    auto output = static_cast<ReceiveStatistics*>(parameter);
+    *output = receive_statistics;
+    output->size = sizeof(*output);
+    _InterlockedDecrement(&active_callbacks);
+    return 0;
+}
+
+#include "image_send.h"
+#include "image_download.h"
 
 // 定向只读探针：仅在手动发送 WXBOT_AT_PROBE 的消息中记录 msgsource 字符串。
 // 不发送消息、不改写消息对象，用于核对该版本真实艾特的元数据布局。

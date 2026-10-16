@@ -131,6 +131,46 @@ class FrameworkTests(unittest.TestCase):
         self.assertTrue(self.manager.records["broken"].thread.is_alive())
         self.assertIn(("filehelper", "好的"), self.backend.sent)
 
+    def test_image_plugins_opt_in_without_changing_existing_text_plugins(self):
+        self.create_plugin("image_handler", "class Plugin:\n def __init__(self):\n  self.seen=[]\n"
+                           " def on_message(self,m,c):\n  self.seen.append((m.type,m.image_path))\n",
+                           manifest={"api": "v1", "message_types": [3], "requires": ["image.receive"]})
+        self.manager.capabilities = CAPABILITIES | {"image.receive"}
+        self.manager.reload()
+        self.manager.dispatch(Message.from_native(11046, {"wx_type": 3, "msg": "<msg><img /></msg>",
+                               "chat_id": "filehelper", "image_path": "saved.png"}, self.backend.session_id))
+        self.manager.dispatch(self.message("echo 文字照常处理"))
+        wait_for(lambda: self.manager.records["image_handler"].handled == 1 and
+                 self.manager.records["echo"].handled == 1 and self.manager.records["id_responder"].handled == 1)
+        self.assertEqual(self.manager.records["image_handler"].instance.seen, [(3, "saved.png")])
+        self.assertEqual(self.backend.sent, [("filehelper", "文字照常处理")])
+
+    def test_invalid_plugin_message_types_are_rejected(self):
+        for index, types in enumerate(([], [True], [0], ["3"], None)):
+            name = f"invalid_images_{index}"
+            self.create_plugin(name, "class Plugin: pass\n", manifest={"message_types": types})
+            self.assertNotIn(name, self.manager.discover())
+            self.assertIn("message_types", self.manager.load_errors[name])
+
+    def test_console_sends_image_with_spaces_in_its_windows_path(self):
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        app.service.bind(self.backend)
+        image = self.root / "图片 sample.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+        self.backend.send_image = Mock(return_value=True)
+        app.execute(f'send-image filehelper "{image}"')
+        self.backend.send_image.assert_called_once_with("filehelper", str(image))
+        self.backend.send_image.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "未接受图片"):
+            app.execute(f'send-image filehelper "{image}"')
+
+    def test_invalid_image_save_directory_is_rejected_during_config_check(self):
+        for value in (None, 123, "", " ", "bad\0path"):
+            self.config["image_directory"] = value
+            self.write_config()
+            with self.subTest(directory=value), self.assertRaisesRegex(ValueError, "image_directory"):
+                self.store.load()
+
     def test_disabled_and_unsupported_plugins_are_not_imported(self):
         source = "raise RuntimeError('此插件不应被导入')\n"
         self.create_plugin("disabled", source)

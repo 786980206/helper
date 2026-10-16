@@ -66,6 +66,9 @@ class BotApplication:
         # 先显示会话 ID，未加入白名单的新群也能被发现；群正文不进入消息日志。
         if message.is_group or message.chat_id.endswith("@chatroom"):
             logger.info("群消息 | 群ID=%s", message.chat_id)
+        elif message.type == 3:
+            logger.info("图片消息 | 会话ID=%s | 状态=%s | 文件=%s", message.chat_id,
+                        message.data.get("image_status", "pending"), message.image_path or "")
         else:
             logger.info("私聊消息 | 发送者微信ID=%s | 内容=%s",
                         message.sender_id or message.chat_id,
@@ -103,7 +106,7 @@ class BotApplication:
         if action in ("quit", "exit", "stop") and len(words) == 1:
             self.stop_event.set()
         elif action == "help" and len(words) == 1:
-            logger.info("命令：status / chats / members [群ID] / history 称呼 [条数] / plugins / enable 名称 / disable 名称 / reload [名称] / quit")
+            logger.info("命令：status / chats / members [群ID] / history 称呼 [条数] / send-image 会话ID \"图片路径\" / plugins / enable 名称 / disable 名称 / reload [名称] / quit")
         elif action == "status" and len(words) == 1:
             logger.info("状态：%s", json.dumps({"connected": self._connection_ready,
                                                "pid": self.backend.pid if self.backend else None,
@@ -112,6 +115,10 @@ class BotApplication:
         elif action == "chats" and len(words) == 1:
             rows = self.backend.chats() if self.backend and hasattr(self.backend, "chats") else []
             logger.info("本次连接已接收的会话：%s", json.dumps(rows, ensure_ascii=False))
+        elif action == "send-image" and len(words) == 3:
+            if not self.service.send_image(words[1], words[2]):
+                raise RuntimeError("微信未接受图片发送请求，请查看原生结果")
+            logger.info("图片发送请求已提交：会话ID=%s", words[1])
         elif action == "members" and len(words) in (1, 2):
             if self.members is None:
                 raise ValueError("尚未配置成员目录")
