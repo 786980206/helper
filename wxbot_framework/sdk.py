@@ -137,6 +137,49 @@ class ServiceFacade:
                 with delivery_guard() if delivery_guard is not None else nullcontext():
                     return backend.send_image(to_wxid, str(image_path))
 
+    def send_emoticon(self, to_wxid, path, *, expected_session=None, delivery_guard=None):
+        validate_target(to_wxid)
+        with self._lock:
+            if self._backend is None or not self._available:
+                raise RuntimeError("微信尚未连接")
+            if expected_session is not None and expected_session != self._backend.session_id:
+                raise RuntimeError("消息所属的微信连接已结束，跳过旧会话回复")
+            if not callable(getattr(self._backend, "send_emoticon", None)):
+                raise CapabilityError("当前后端尚未开放表情发送")
+            backend, cancel = self._backend, self._cancel
+        # 完整 GIF 校验可能较慢；先固定连接，校验期间重连也不能串到新账号。
+        from .emoticons import validate_emoticon_path
+        emoticon_path = validate_emoticon_path(path)
+        with self._send_lock:
+            with self._lock:
+                self._check_pending(backend, cancel)
+            emoticon_path = validate_emoticon_path(emoticon_path)
+            with self._lock:
+                self._check_pending(backend, cancel)
+                with delivery_guard() if delivery_guard is not None else nullcontext():
+                    self._check_pending(backend, cancel)
+                    return backend.send_emoticon(to_wxid, str(emoticon_path))
+
+    def export_emoticons(self, *, convert=True, expected_session=None):
+        if type(convert) is not bool:
+            raise ValueError("convert 必须是布尔值")
+        with self._lock:
+            if self._backend is None or not self._available:
+                raise RuntimeError("微信尚未连接")
+            if expected_session is not None and expected_session != self._backend.session_id:
+                raise RuntimeError("消息所属的微信连接已结束，跳过旧会话导出")
+            if not callable(getattr(self._backend, "export_emoticons", None)):
+                raise CapabilityError("当前后端尚未开放表情导出")
+            backend, cancel = self._backend, self._cancel
+        with self._send_lock:
+            with self._lock:
+                self._check_pending(backend, cancel)
+            # 导出/转换可能耗时较长，让断线清理能够及时取消当前账号任务。
+            result = backend.export_emoticons(convert=convert)
+            with self._lock:
+                self._check_pending(backend, cancel)
+                return result
+
     def send_at_text(self, room_wxid, content, at_list, *, expected_session=None, display_names=None, delivery_guard=None):
         members = validate_mentions(room_wxid, at_list)
         if not isinstance(content, str) or not content:
@@ -187,6 +230,12 @@ class LegacyService:
     def send_image(self, to_wxid, path):
         return self._service.send_image(to_wxid, path, expected_session=self._session_id)
 
+    def send_emoticon(self, to_wxid, path):
+        return self._service.send_emoticon(to_wxid, path, expected_session=self._session_id)
+
+    def export_emoticons(self, *, convert=True):
+        return self._service.export_emoticons(convert=convert, expected_session=self._session_id)
+
     def send_payload(self, payload):
         return self._service.send_payload(payload, expected_session=self._session_id)
 
@@ -223,6 +272,12 @@ class PluginContext:
     def send_image(self, chat_id, path):
         return self._service.send_image(chat_id, path)
 
+    def send_emoticon(self, chat_id, path):
+        return self._service.send_emoticon(chat_id, path)
+
+    def export_emoticons(self, *, convert=True):
+        return self._service.export_emoticons(convert=convert)
+
     def personality(self, message):
         from .personality import PersonalityState
         return self._members.personality(message.chat_id) if self._members is not None else PersonalityState(message.chat_id)
@@ -248,6 +303,10 @@ class PluginContext:
     def reply_image(self, message, path, *, delivery_guard=None):
         return self._service.send_image(message.chat_id, path, expected_session=message.session_id,
                                         delivery_guard=delivery_guard)
+
+    def reply_emoticon(self, message, path, *, delivery_guard=None):
+        return self._service.send_emoticon(message.chat_id, path, expected_session=message.session_id,
+                                           delivery_guard=delivery_guard)
 
     def reply_at(self, message, text, *, display_name=None, delivery_guard=None):
         if not message.is_group:

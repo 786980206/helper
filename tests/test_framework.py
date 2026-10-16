@@ -171,6 +171,37 @@ class FrameworkTests(unittest.TestCase):
             with self.subTest(directory=value), self.assertRaisesRegex(ValueError, "image_directory"):
                 self.store.load()
 
+    def test_emoticon_console_commands_preserve_paths_and_report_rejection(self):
+        from dataclasses import make_dataclass
+        from PIL import Image
+        app = BotApplication(self.root, self.store, backend_factory=lambda: self.backend)
+        app.service.bind(self.backend)
+        path = self.root / "动态 sticker.gif"
+        Image.new("RGB", (4, 4), "green").save(path)
+        self.backend.send_emoticon = Mock(return_value=True)
+        app.execute(f'send-emoticon filehelper "{path}"')
+        self.backend.send_emoticon.assert_called_once_with("filehelper", str(path))
+        self.backend.send_emoticon.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "未接受表情"):
+            app.execute(f'send-emoticon filehelper "{path}"')
+        Row = make_dataclass("Row", ["gif_path", "sendable"])
+        self.backend.export_emoticons = Mock(return_value=(Row(path, True),))
+        app.execute("export-emoticons")
+        app.execute("export-emoticons raw")
+        self.assertEqual(self.backend.export_emoticons.call_args_list,
+                         [unittest.mock.call(convert=True), unittest.mock.call(convert=False)])
+
+    def test_invalid_emoticon_directories_are_rejected_during_config_check(self):
+        for field, values in (("emoticon_directory", (None, 123, "", " ", "bad\0path")),
+                              ("wechat_data_directory", (123, "", " ", "bad\0path"))):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.config[field] = value
+                    self.write_config()
+                    with self.assertRaisesRegex(ValueError, field):
+                        self.store.load()
+            self.config.pop(field, None)
+
     def test_disabled_and_unsupported_plugins_are_not_imported(self):
         source = "raise RuntimeError('此插件不应被导入')\n"
         self.create_plugin("disabled", source)

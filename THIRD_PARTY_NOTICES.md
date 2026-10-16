@@ -7,3 +7,5 @@
 - `native/vendor/minhook-1.3.4/src/hde/` 下的原始版权声明
 
 保留的 DLL 由本项目桥接源码和上述组件构建；不包含微信客户端程序或微信核心 DLL。
+
+Python 依赖通过 `requirements.txt` 安装，不将它们的二进制复制进本仓库。表情缓存解密使用 cryptography，图片结构校验使用 Pillow，WXGF 动画转换使用 imageio-ffmpeg 所带的 FFmpeg；这些软件的许可证随各自发行包提供。

@@ -71,6 +71,14 @@ class ConfigStore:
         if (not isinstance(image_directory, str) or not image_directory.strip() or
                 "\0" in image_directory):
             raise ValueError("image_directory 应为图片保存目录路径")
+        emoticon_directory = data.get("emoticon_directory", ".runtime/emoticons")
+        if (not isinstance(emoticon_directory, str) or not emoticon_directory.strip() or
+                "\0" in emoticon_directory):
+            raise ValueError("emoticon_directory 应为表情导出目录路径")
+        data_directory = data.get("wechat_data_directory")
+        if data_directory is not None and (not isinstance(data_directory, str) or
+                                           not data_directory.strip() or "\0" in data_directory):
+            raise ValueError("wechat_data_directory 应为当前账号数据目录路径或 null")
         pid = data.get("wechat_pid")
         if pid is not None and (type(pid) is not int or pid <= 0):
             raise ValueError("wechat_pid 应为正整数或 null")

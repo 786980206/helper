@@ -1,4 +1,4 @@
-"""版本锁定的原生桥接，只开放当前用户的文件传输助手。"""
+"""版本锁定的原生桥接，复用当前账号的任务队列。"""
 from __future__ import annotations
 
 import ctypes as c
@@ -56,6 +56,10 @@ class AtTextConfig(TextConfig):
     _fields_ = [("members", c.c_char * 1024)]
 
 
+class EmoticonConfig(TextConfig):
+    _fields_ = [("account", c.c_char * 128), ("send", c.c_uint32), ("reserved", c.c_uint32)]
+
+
 class ImageDownloadConfig(Config):
     _fields_ = [("filekey", c.c_char * 1024), ("aeskey", c.c_char * 65),
                 ("image_type", c.c_uint32)]
@@ -63,6 +67,8 @@ class ImageDownloadConfig(Config):
 
 assert c.sizeof(Config) == 1560 and c.sizeof(TextConfig) == 1688 and c.sizeof(AtTextConfig) == 2712
 assert c.sizeof(ImageDownloadConfig) == 2656
+assert c.sizeof(EmoticonConfig) == 1824 and EmoticonConfig.account.offset == 1688
+assert EmoticonConfig.send.offset == 1816 and EmoticonConfig.reserved.offset == 1820
 
 
 class ProcessEntry(c.Structure):
@@ -151,14 +157,15 @@ def find_wechat():
 
 def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_report=True,
         bridge_path=None, target="filehelper", mentions=None, image_path=None, image_probe=False,
-        download_image=None):
+        download_image=None, emoticon_path=None, emoticon_probe=False, account=None):
     dll = Path(bridge_path or DLL).resolve()
     if dll not in (DLL.resolve(), TEXT_DLL.resolve()):
         raise ValueError("不支持的桥接 DLL 路径")
     generic = dll == TEXT_DLL.resolve()
     downloading = mode == "--download-image"
     if downloading:
-        if not generic or not isinstance(download_image, dict) or image_path is not None or mentions is not None:
+        if (not generic or not isinstance(download_image, dict) or image_path is not None or
+                emoticon_path is not None or mentions is not None):
             raise ValueError("图片下载需要通用桥接和完整下载参数")
         destination = Path(download_image["destination"]).resolve()
         if destination.exists() or not destination.parent.is_dir():
@@ -176,6 +183,18 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
         text = str(destination)
     elif download_image is not None:
         raise ValueError("下载参数仅用于图片下载操作")
+    if type(emoticon_probe) is not bool:
+        raise ValueError("表情路径检查标志必须是布尔值")
+    if emoticon_path is not None:
+        if (not generic or mode != "--dispatch" or mentions is not None or
+                image_path is not None or image_probe):
+            raise ValueError("表情文件仅用于通用表情发送或路径检查，不能与其他发送参数混用")
+        from wxbot_framework.account import validate_account
+        account = validate_account(account)
+        from wxbot_framework.emoticons import validate_emoticon_path
+        text = str(validate_emoticon_path(emoticon_path))
+    elif emoticon_probe or account is not None:
+        raise ValueError("表情路径检查和账号参数需要 emoticon_path")
     if image_path is not None:
         if not generic or mode != "--dispatch" or mentions is not None:
             raise ValueError("图片文件仅用于通用图片发送或路径检查")
@@ -184,7 +203,7 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
     elif image_probe:
         raise ValueError("图片路径检查需要 image_path")
     if generic and mode not in ("--dispatch", "--listen", "--remove", "--probe-at", "--download-image"):
-        raise ValueError("通用桥接只支持文本与图片收发、监听和卸载")
+        raise ValueError("通用桥接只支持文本、图片与表情、监听和卸载")
     if not generic and target != "filehelper":
         raise ValueError("旧自测桥接仅支持文件传输助手")
     if generic:
@@ -240,6 +259,8 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
                 name = b"WxSendAtText"
             if image_path is not None:
                 name = b"WxInspectImagePath" if image_probe else b"WxSendImage"
+            if emoticon_path is not None:
+                name = b"WxInspectEmoticonPath" if emoticon_probe else b"WxSendEmoticon"
         export = next(item.address for item in pe.DIRECTORY_ENTRY_EXPORT.symbols if item.name == name)
 
         def allocate(data):
@@ -262,7 +283,8 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
         report_path = ROOT / f".runtime/native_requests/{uuid.uuid4().hex}.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         if len(str(report_path)) >= 260: raise RuntimeError("报告路径超过原生接口长度")
-        config = ImageDownloadConfig() if downloading else AtTextConfig() if mentions is not None else (TextConfig() if generic else Config())
+        config = (EmoticonConfig() if emoticon_path is not None else ImageDownloadConfig() if downloading else
+                  AtTextConfig() if mentions is not None else TextConfig() if generic else Config())
         config.size, config.pid, config.manager = c.sizeof(config), pid, 0
         config.log_path, config.text = str(report_path), encoded
         if generic and not downloading:
@@ -273,6 +295,9 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
             config.image_type = download_image.get("image_type", 2)
         if mentions is not None:
             config.members = ",".join(mentions).encode("ascii")
+        if emoticon_path is not None:
+            config.account = account.encode("ascii")
+            config.send = 0 if emoticon_probe else 1
         config_parameter = allocate(bytes(config))
         exit_code = remote_call(process, loaded[0] + export, config_parameter)
         if mode == "--remove" and exit_code == 0:
@@ -283,7 +308,7 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
         if mode == "--remove":
             result["dll_unloaded"] = dll.name.lower() not in modules(pid)
         if mode in ("--dispatch", "--download-image"):
-            deadline = time.monotonic() + (120 if downloading else 15)
+            deadline = time.monotonic() + (120 if downloading or emoticon_path is not None else 15)
             while exit_code == 0 and not report_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.05)
             if report_path.exists():
@@ -307,6 +332,11 @@ def run(mode, *, pid=None, text="WXNATIVE_TEST_3", keep_loaded=False, preserve_r
                                  and ((result["report"].get("image_path") == text) if downloading else
                                       (result["report"].get("target") == target and result["report"].get("text") == text))
                                  and cleanup_code == 0 and (keep_loaded or result.get("dll_unloaded") is True))
+            if emoticon_path is not None:
+                report = result.get("report", {})
+                result["success"] = (result["success"] and report.get("message_type") == 47 and
+                    report.get("emoticon_path") == text and report.get("sent") is (not emoticon_probe) and
+                    report.get("operation") == ("emoticon_probe" if emoticon_probe else "emoticon_send"))
             if mentions is not None:
                 result["success"] = result["success"] and result["report"].get("at_members") == ",".join(mentions)
             if not preserve_report and result["success"]:

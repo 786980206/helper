@@ -34,7 +34,8 @@ def inspect(root, private_markers=()):
         raw = path.read_bytes()
         total += len(raw)
         label = relative.as_posix()
-        if path.suffix.lower() in ('.pyc','.obj','.pdb','.lib','.exp','.exe','.dmp','.db','.sqlite','.sqlite3','.bak','.zip'):
+        if path.suffix.lower() in ('.pyc','.obj','.pdb','.lib','.exp','.exe','.dmp','.db','.sqlite','.sqlite3','.bak','.zip',
+                                   '.wxgf','.hevc','.gif','.png','.jpg','.jpeg','.webp','.bmp'):
             findings.append({'file':label,'kind':'unnecessary_or_private_artifact'})
         if path.suffix.lower() == '.dll' and label not in ALLOWED_DLLS:
             findings.append({'file':label,'kind':'unexpected_binary'})
@@ -58,6 +59,8 @@ def inspect(root, private_markers=()):
             data=json.loads(path.read_text(encoding='utf-8'))
             if data.get('wechat_account') not in (None,'wxid_example_robot') or data.get('wechat_pid') is not None or data.get('chat_allowlist'):
                 findings.append({'file':filename,'kind':'nonempty_account_or_chat_binding'})
+            if data.get('wechat_data_directory'):
+                findings.append({'file':filename,'kind':'nonempty_personal_data_directory'})
             if data.get('plugins',{}).get('idiom_chain',{}).get('member_names'):
                 findings.append({'file':filename,'kind':'nonempty_member_names'})
     for filename in ('members_config.json','members_config.example.json'):

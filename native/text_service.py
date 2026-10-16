@@ -70,7 +70,8 @@ class NativeTextService(NativeFileHelperService):
     _message_type = ReceivedMediaMessage
     _run = staticmethod(run_text)
 
-    def __init__(self, *, account=None, media_directory=None, image_allowlist=(), **options):
+    def __init__(self, *, account=None, media_directory=None, image_allowlist=(),
+                 wechat_data_directory=None, emoticon_directory=None, **options):
         super().__init__(**options)
         self.preferred_account = validate_account(account) if account is not None else None
         self.router = TextRouter(include_self_groups=True)
@@ -81,6 +82,9 @@ class NativeTextService(NativeFileHelperService):
         self.media_directory = Path(media_directory or Path(__file__).resolve().parent.parent / ".runtime/images")
         self.image_allowlist = frozenset(image_allowlist)
         self._image_receiver = None
+        self.wechat_data_directory = Path(wechat_data_directory) if wechat_data_directory is not None else None
+        self.emoticon_directory = Path(emoticon_directory or
+                                       Path(__file__).resolve().parent.parent / ".runtime/emoticons")
 
     @property
     def self_wxid(self):
@@ -237,6 +241,49 @@ class NativeTextService(NativeFileHelperService):
                                         target=to_wxid, keep_loaded=True,
                                         preserve_report=self.preserve_reports)
             return self.last_result["success"]
+
+    def send_emoticon(self, to_wxid, path):
+        from wxbot_framework.emoticons import validate_emoticon_path
+        validate_target(to_wxid)
+        path = validate_emoticon_path(path)
+        with self._calls:
+            if not self._owns_bridge or self._stop.is_set():
+                raise RuntimeError("原生表情服务没有运行")
+            self._check_account(force=True)
+            self.last_result = self._run("--dispatch", pid=self.pid, emoticon_path=path,
+                                        account=self.self_wxid, target=to_wxid, keep_loaded=True,
+                                        preserve_report=self.preserve_reports)
+            self._check_account(force=True)
+            return self.last_result["success"]
+
+    def export_emoticons(self, *, convert=True):
+        from wxbot_framework.emoticon_account import read_emoticon_cache_key
+        from wxbot_framework.emoticons import export_local_emoticons
+        if type(convert) is not bool:
+            raise ValueError("convert 必须是布尔值")
+        if self.wechat_data_directory is None:
+            raise ValueError("请先在本地配置 wechat_data_directory，指向当前账号的数据目录")
+        with self._calls:
+            if not self._owns_bridge or self._stop.is_set() or self._channel is None:
+                raise RuntimeError("原生表情服务没有运行")
+            self._check_account(force=True)
+            account = self.self_wxid
+            key = read_emoticon_cache_key(self._channel.read_memory, self._channel.core_base,
+                                          expected_account=account)
+
+            def is_current():
+                return (self._owns_bridge and not self._stop.is_set() and
+                        self.self_wxid == account and self._read_account() == account)
+
+            try:
+                result = export_local_emoticons(self.wechat_data_directory, self.emoticon_directory,
+                                               key, expected_account=account, convert=convert,
+                                               is_current=is_current)
+                self._check_account(force=True)
+                return result
+            finally:
+                # 不持久化密钥；引用只活到这次显式导出结束。
+                del key
 
     def _send_text(self, to_wxid, content, *, mentions=None):
         validate_target(to_wxid)

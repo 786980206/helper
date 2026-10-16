@@ -10,7 +10,8 @@ from .sdk import Message
 CAPABILITIES = frozenset({"text.receive", "text.send"})
 TEXT_CAPABILITIES = CAPABILITIES | frozenset({"friend.text.receive", "friend.text.send",
                                            "group.text.receive", "group.text.send", "group.text.mention",
-                                           "image.receive", "image.send"})
+                                           "image.receive", "image.send",
+                                           "emoticon.send", "emoticon.extract"})
 
 
 class NativeFileHelperBackend:
@@ -47,7 +48,7 @@ class NativeFileHelperBackend:
 
 
 class NativeTextBackend(NativeFileHelperBackend):
-    scope = "文件传输助手、好友和群聊的文本、图片"
+    scope = "文件传输助手、好友和群聊的文本、图片；表情发送和本地缓存导出"
 
     def __init__(self, root, config):
         native = Path(root) / "native"
@@ -59,6 +60,9 @@ class NativeTextBackend(NativeFileHelperBackend):
         self.raw = NativeTextService(pid=config.get("wechat_pid"), account=config.get("wechat_account"),
                                      media_directory=Path(root) / config.get("image_directory", ".runtime/images"),
                                      image_allowlist=config.get("chat_allowlist", []),
+                                     wechat_data_directory=(Path(root) / config["wechat_data_directory"]
+                                                            if config.get("wechat_data_directory") else None),
+                                     emoticon_directory=Path(root) / config.get("emoticon_directory", ".runtime/emoticons"),
                                      preserve_reports=False)
         self.session_id = uuid.uuid4().hex
 
@@ -81,3 +85,9 @@ class NativeTextBackend(NativeFileHelperBackend):
 
     def send_image(self, chat_id, path):
         return self.raw.send_image(chat_id, path)
+
+    def send_emoticon(self, chat_id, path):
+        return self.raw.send_emoticon(chat_id, path)
+
+    def export_emoticons(self, *, convert=True):
+        return self.raw.export_emoticons(convert=convert)
